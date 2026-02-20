@@ -1,0 +1,22 @@
+# Datos de nodos (generados al correr)
+node_data_*/
+
+# Wallets (claves privadas — nunca subir)
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.env
+venv/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

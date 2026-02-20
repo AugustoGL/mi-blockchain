@@ -1,6 +1,12 @@
-# 🪙 Mi Blockchain — Instrucciones para minar
+# 🪙 Mi Blockchain
 
-## Requisitos
+Red blockchain P2P con Proof of Work, minado automático y transferencias firmadas con ECDSA.
+
+---
+
+## Instalación
+
+Requiere Python 3.10+
 
 ```bash
 pip install flask cryptography
@@ -8,139 +14,180 @@ pip install flask cryptography
 
 ---
 
-## Si sos VOS (el que tiene el bootstrap)
+## Dificultad de la red
 
-### Paso 1 — Editá tu IP pública en run_node.py
+La dificultad se define **una sola vez** al arrancar el bootstrap y queda grabada en el bloque génesis. Todos los nodos que se conecten la heredan automáticamente.
 
-Abrí `run_node.py` y cambiá esta línea con tu IP pública
-(la podés ver en https://whatismyip.com):
+Para cambiarla, editá esta línea en `run_node.py`:
 
 ```python
-BOOTSTRAP_HOST = "190.123.45.67"   # ← tu IP pública acá
+blockchain = Blockchain(difficulty=5)  # ← cambiá este número
 ```
 
-### Paso 2 — Abrí el puerto en tu router
+| Dificultad | Tiempo aprox. por bloque |
+|---|---|
+| 3 | < 1 segundo |
+| 4 | 1-5 segundos |
+| 5 | 10-30 segundos |
+| 6 | 1-5 minutos |
 
-En tu router hacé **port forwarding** del puerto **6000 TCP**
-hacia tu PC (IP local, por ejemplo 192.168.1.100).
+> ⚠️ Si cambiás la dificultad después de que la red ya está corriendo, tu nodo va a ser incompatible con el resto. La dificultad solo se puede cambiar antes del primer bloque génesis.
 
-### Paso 3 — Levantá el nodo bootstrap
+---
 
+## Correr en local
+
+Para probar la blockchain en tu propia máquina con múltiples nodos.
+
+**Terminal 1 — nodo bootstrap:**
 ```bash
 python run_node.py 6000 8000
 ```
 
-Dejalo corriendo. Este es el nodo central al que se conectan todos.
-
----
-
-## Si sos el AMIGO (querés minar)
-
-### Paso 1 — Editá run_node.py con la IP del bootstrap
-
-Abrí `run_node.py` y fijate que BOOTSTRAP_HOST tenga la IP
-pública del que te pasó el código:
-
-```python
-BOOTSTRAP_HOST = "190.123.45.67"   # IP del que te pasó esto
-BOOTSTRAP_P2P  = 6000
-```
-
-### Paso 2 — Levantá tu nodo
-
+**Terminal 2 — segundo nodo:**
 ```bash
 python run_node.py 6001 8001
 ```
 
-Listo. El nodo se conecta solo al bootstrap, descarga la cadena
-y empieza a minar automáticamente.
+**Terminal 3 — tercer nodo:**
+```bash
+python run_node.py 6002 8002
+```
+
+Los nodos se conectan automáticamente entre sí y empiezan a minar. Podés abrir tantos como quieras incrementando los puertos.
+
+**Verificar que están sincronizados:**
+```bash
+curl http://localhost:8000/status
+curl http://localhost:8001/status
+```
+
+**Ver toda la red:**
+```bash
+curl http://localhost:8000/network
+```
 
 ---
 
-## Comandos útiles
+## Correr el bootstrap
 
-Ver estado del nodo:
-```bash
-curl http://localhost:8000/status
+El bootstrap es el nodo central al que se conectan todos. Tiene que estar siempre encendido con una IP/URL accesible.
+
+**Paso 1 — Editá `run_node.py` con tu URL pública:**
+```python
+# Si usás ngrok:
+BOOTSTRAP_URL = "https://abc123.ngrok-free.app"
+
+# Si tenés IP fija:
+BOOTSTRAP_URL = "http://190.123.45.67:8000"
 ```
 
-Ver la blockchain:
+**Paso 2 — Abrí ngrok** (si no tenés IP fija):
 ```bash
-curl http://localhost:8000/chain
+# Terminal 1 — el nodo
+python run_node.py 6000 8000
+
+# Terminal 2 — el túnel
+ngrok http 8000
 ```
 
-Ver tus coins minados (reemplazá PORT por tu puerto API):
+Ngrok te da una URL pública. Copiala y pegala en `BOOTSTRAP_URL`.
+
+**Paso 3 — Actualizá `public_url` en `run_node.py`:**
+```python
+node.public_url = "https://abc123.ngrok-free.app"
+```
+
+Esto es importante para que otros nodos sepan cómo contactarte.
+
+> ⚠️ En el plan gratuito de ngrok la URL cambia cada vez que reiniciás el túnel. Tenés que avisarle a tus peers la nueva URL.
+
+---
+
+## Conectarse a un bootstrap
+
+Para unirte a una red existente y empezar a minar.
+
+**Paso 1 — Editá `BOOTSTRAP_URL` en `run_node.py`:**
+```python
+BOOTSTRAP_URL = "https://abc123.ngrok-free.app"  # URL que te pasó el bootstrap
+```
+
+**Paso 2 — Corré el nodo:**
+```bash
+python run_node.py 6001 8001
+```
+
+El nodo se conecta automáticamente al bootstrap, descarga la cadena completa y empieza a minar.
+
+También podés pasar la URL como argumento sin editar el archivo:
+```bash
+python run_node.py 6001 8001 https://abc123.ngrok-free.app
+```
+
+---
+
+## API REST
+
+Cada nodo expone una API en su puerto configurado.
+
+| Método | Endpoint | Descripción |
+|---|---|---|
+| GET | `/status` | Estado del nodo |
+| GET | `/chain` | Blockchain completa |
+| GET | `/block/<n>` | Bloque por índice |
+| GET | `/mempool` | Transacciones pendientes |
+| GET | `/utxos` | Todos los UTXOs |
+| GET | `/network` | Todos los nodos conectados |
+| GET | `/mining/status` | Estado del minado |
+| POST | `/balance` | Balance de una wallet |
+| POST | `/transaction` | Enviar transacción firmada |
+| POST | `/fund` | Fondear wallet (solo testing) |
+| POST | `/mining/stop` | Pausar minado |
+| POST | `/mining/start` | Reanudar minado |
+| POST | `/connect` | Conectar a un peer manualmente |
+
+---
+
+## Wallets y coins
+
+Cada nodo genera automáticamente una wallet de minero al arrancar. Los coins minados van a esa wallet.
+
+La clave privada se guarda en:
+```
+node_data_<puerto>/miner_wallet.pem
+```
+
+> ⚠️ No pierdas este archivo. Es la única forma de acceder a tus coins.
+
+Para ver cuánto minaste:
 ```bash
 curl http://localhost:8000/mining/status
 ```
 
-Ver balance de una wallet:
-```bash
-curl -X POST http://localhost:8000/balance \
-  -H "Content-Type: application/json" \
-  -d "{\"address\": \"TU_CLAVE_PUBLICA_PEM\"}"
-```
-
 ---
 
-## Varios nodos en la misma PC
-
-```bash
-# Terminal 1
-python run_node.py 6000 8000
-
-# Terminal 2
-python run_node.py 6001 8001
-
-# Terminal 3
-python run_node.py 6002 8002
-```
-
-Cada nodo mina en paralelo y se sincroniza con los demás.
-
----
-
-## Cómo se ganan coins
-
-Cada vez que tu nodo mina un bloque recibe **50 coins** (coinbase).
-Los coins quedan en la wallet guardada en:
-
-```
-node_data_6000/miner_wallet.pem   ← clave privada, no la pierdas
-```
-
----
-
-## Hacer una transferencia
-
-Usá el script incluido:
+## Hacer transferencias
 
 ```bash
 python test_transferencias.py
 ```
 
-O manualmente via API:
-
-```bash
-# 1. Ver UTXOs disponibles
-curl http://localhost:8000/utxos
-
-# 2. Enviar TX (creada y firmada con wallet.py)
-curl -X POST http://localhost:8000/transaction \
-  -H "Content-Type: application/json" \
-  -d @mi_transaccion.json
-```
+El script crea wallets de prueba, las fondea y ejecuta transferencias entre los nodos corriendo.
 
 ---
 
-## Topología de red recomendada
+## Estructura del proyecto
 
 ```
-         [Bootstrap :6000]
-        /        |        \
-   [6001]      [6002]    [6003]  ← amigos
+├── run_node.py          ← punto de entrada
+├── blockchain.py        ← lógica principal, UTXO set
+├── block.py             ← estructura de bloque y PoW
+├── transaction.py       ← transacciones ECDSA
+├── wallet.py            ← generación y firma de wallets
+├── node.py              ← red P2P via HTTP
+├── api.py               ← API REST (Flask)
+├── miner.py             ← loop de minado automático
+├── storage.py           ← persistencia en disco (JSON)
+└── test_transferencias.py
 ```
-
-Una vez conectados al bootstrap, los nodos se descubren
-entre sí automáticamente y el bootstrap puede apagarse
-sin que la red se caiga.
