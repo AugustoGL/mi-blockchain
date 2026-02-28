@@ -2,15 +2,18 @@
 run_node.py — Punto de entrada para levantar un nodo completo.
 
 Uso:
-    python run_node.py                        # bootstrap local
+    python run_node.py                        # bootstrap local (puerto 8000)
     python run_node.py 6001 8001              # nodo que se conecta al bootstrap local
     python run_node.py 6001 8001 http://abc.ngrok.io  # conectar a bootstrap ngrok
 
 Si tenés ngrok corriendo, pasá la URL pública como tercer argumento.
 """
 
-import sys, threading, time, os
-import storage.storage as storage_module
+import sys
+import threading
+import time
+import os
+import storage as storage_module
 
 # ══════════════════════════════════════════════════════════════════
 #  CONFIGURACIÓN
@@ -19,7 +22,7 @@ import storage.storage as storage_module
 # URL pública del bootstrap. Cambiá esto por tu URL de ngrok.
 # Ejemplo: BOOTSTRAP_URL = "https://abc123.ngrok-free.app"
 # Si corrés todo local, dejalo en None y usá el argumento de línea de comandos.
-BOOTSTRAP_URL = "http://127.0.0.1:8000"   # ← acá va tu URL ngrok cuando la tengas
+BOOTSTRAP_URL = "http://127.0.0.1:8000"
 
 # ══════════════════════════════════════════════════════════════════
 
@@ -29,21 +32,22 @@ PEER_URL_ARG = sys.argv[3]      if len(sys.argv) > 3 else None
 
 # Determinar a qué peer conectarse
 if PEER_URL_ARG:
-    PEER_URL = PEER_URL_ARG                    # argumento explícito
+    PEER_URL = PEER_URL_ARG
 elif BOOTSTRAP_URL and P2P_PORT != 6000:
-    PEER_URL = BOOTSTRAP_URL                   # bootstrap hardcodeado
+    PEER_URL = BOOTSTRAP_URL
 elif P2P_PORT != 6000:
-    PEER_URL = "http://127.0.0.1:8000"         # bootstrap local por defecto
+    PEER_URL = "http://127.0.0.1:8000"
 else:
-    PEER_URL = None                            # soy el bootstrap
+    PEER_URL = None   # soy el bootstrap
 
+# Carpeta de datos separada por nodo para que varios nodos corran en la misma máquina
 storage_module.DATA_DIR = f"node_data_{P2P_PORT}"
 
-from core.blockchain import Blockchain
-from core.wallet import Wallet
-from network.node import Node
+from blockchain import Blockchain
+from wallet import Wallet
+from node import Node
 from miner import Miner
-from network.api import create_app
+from api import create_app
 
 print(f"""
 ╔══════════════════════════════════════════╗
@@ -54,7 +58,7 @@ print(f"""
 """)
 
 # ── 1. Blockchain ────────────────────────────────────────────────
-blockchain = Blockchain(difficulty=2)
+blockchain = Blockchain(difficulty=6)
 
 # ── 2. Nodo P2P ─────────────────────────────────────────────────
 node = Node(host="0.0.0.0", port=API_PORT, blockchain=blockchain)
@@ -66,7 +70,7 @@ os.makedirs(f"node_data_{P2P_PORT}", exist_ok=True)
 
 if os.path.exists(miner_key_file):
     miner_wallet = Wallet(key_file=miner_key_file)
-    print(f"🔑 Wallet de minero cargada")
+    print("🔑 Wallet de minero cargada")
 else:
     miner_wallet = Wallet()
     miner_wallet.save(miner_key_file)
@@ -91,13 +95,11 @@ time.sleep(1)  # esperar que Flask arranque
 # ── 5. Conectar al peer/bootstrap ────────────────────────────────
 if PEER_URL:
     print(f"\n🔗 Conectando a {PEER_URL}...")
-    success = node.connect_to_peer(
-        peer_host=None, peer_port=None, peer_url=PEER_URL
-    )
+    success = node.connect_to_peer(peer_host=None, peer_port=None, peer_url=PEER_URL)
     if success:
-        print(f"✅ Conectado y sincronizando cadena...")
+        print("✅ Conectado y sincronizando cadena...")
     else:
-        print(f"⚠️  No se pudo conectar. Arrancando solo.")
+        print("⚠️  No se pudo conectar. Arrancando solo.")
 
 print(f"""
 ✅  Nodo listo en http://localhost:{API_PORT}

@@ -2,13 +2,37 @@ from core.block import Block
 import time
 from core.transaction import Transaction, TxInput, TxOutput
 import copy
-import storage.storage as storage
+from storage import storage
 
 
 
 
-MAX_TX_PER_BLOCK = 5
-MINING_REWARD = 50
+MAX_TX_PER_BLOCK  = 5
+MAX_MEMPOOL_SIZE  = 500
+TX_EXPIRY_SECONDS = 24 * 60 * 60
+
+# ── Política monetaria ────────────────────────────────────────────
+INITIAL_REWARD      = 50          # coins por bloque al inicio
+HALVING_INTERVAL    = 210         # cada cuántos bloques se reduce la recompensa a la mitad
+MAX_SUPPLY          = 21_000_000  # emisión máxima total (como Bitcoin)
+
+# ── Ajuste de dificultad ─────────────────────────────────────────
+DIFFICULTY_INTERVAL = 10          # ajustar cada N bloques
+TARGET_BLOCK_TIME   = 30          # segundos objetivo por bloque
+
+def get_mining_reward(block_index: int) -> float:
+    """
+    Calcula la recompensa de minado para un bloque dado su índice.
+    Cada HALVING_INTERVAL bloques la recompensa se divide a la mitad.
+    Bloque 0-209:   50 coins
+    Bloque 210-419: 25 coins
+    Bloque 420-629: 12.5 coins
+    ...
+    Cuando la recompensa llega a 0 los mineros solo cobran fees.
+    """
+    halvings = block_index // HALVING_INTERVAL
+    reward   = INITIAL_REWARD / (2 ** halvings)
+    return max(0, reward)
 
 
 class Blockchain:
@@ -16,7 +40,8 @@ class Blockchain:
         self.difficulty = difficulty
         self.chain = []
         self.pending_transactions = []
-        self.utxo_set = {}  # {(tx_id, output_index): TxOutput}
+        self.utxo_set = {}       # {(tx_id, output_index): TxOutput}
+        self.tx_index = {}       # {tx_id: block_index} — búsqueda O(1) por tx_id
 
         if storage.has_saved_data():
             # ── Caso A: ya existe una blockchain guardada → la cargamos ──
@@ -24,6 +49,7 @@ class Blockchain:
             self.chain                = storage.load_chain()
             self.utxo_set             = storage.load_utxo_set()
             self.pending_transactions = storage.load_mempool()
+            self._rebuild_tx_index()
             print("✅ Blockchain restaurada desde disco")
         else:
             # ── Caso B: primera vez → creamos el bloque génesis ──
@@ -66,6 +92,11 @@ class Blockchain:
             print("❌ Verify falló:", e)
             return False
 
+        # Límite de mempool — rechazar si está llena
+        if len(self.pending_transactions) >= MAX_MEMPOOL_SIZE:
+            print(f"❌ Mempool llena ({MAX_MEMPOOL_SIZE} TXs), TX rechazada")
+            return False
+
         print("✅ TX aceptada")
         self.pending_transactions.append(tx)
         storage.save_mempool(self.pending_transactions)  # persistir mempool
@@ -94,6 +125,18 @@ class Blockchain:
     def mine_pending_transactions(self, miner_pubkey_pem):
         utxo_snapshot = copy.deepcopy(self.utxo_set)
 
+        # 0. Limpiar TXs expiradas antes de minar
+        ahora = time.time()
+        antes = len(self.pending_transactions)
+        self.pending_transactions = [
+            tx for tx in self.pending_transactions
+            if ahora - tx.timestamp <= TX_EXPIRY_SECONDS
+        ]
+        expiradas = antes - len(self.pending_transactions)
+        if expiradas > 0:
+            print(f"🗑️  {expiradas} TXs expiradas eliminadas de la mempool")
+            storage.save_mempool(self.pending_transactions)
+
         # 1. Seleccionar TXs por fee
         sorted_txs = sorted(
             self.pending_transactions,
@@ -115,12 +158,13 @@ class Blockchain:
         # 2. Calcular fees
         fees_collected = sum(self.get_tx_fee(tx) for tx in selected)
 
-        # 3. Coinbase
+        # 3. Coinbase con halving
+        reward      = get_mining_reward(len(self.chain))
         coinbase_tx = Transaction(
             inputs=[],
             outputs=[
                 TxOutput(
-                    amount=MINING_REWARD + fees_collected,
+                    amount=reward + fees_collected,
                     recipient_public_key_pem=miner_pubkey_pem
                 )
             ]
@@ -194,6 +238,47 @@ class Blockchain:
     def get_latest_block(self):
         return self.chain[-1]
 
+    def get_circulating_supply(self) -> float:
+        """Calcula el total de coins emitidos recorriendo los coinbases."""
+        total = 0
+        for block in self.chain:
+            for tx in block.transactions:
+                if hasattr(tx, "is_coinbase") and tx.is_coinbase():
+                    total += sum(o.amount for o in tx.outputs)
+        return total
+
+    def calculate_next_difficulty(self) -> int:
+        """
+        Ajuste de dificultad cada DIFFICULTY_INTERVAL bloques.
+        Compara el tiempo real vs el tiempo objetivo y ajusta.
+        Limita el ajuste a x2 o /2 por intervalo (igual que Bitcoin).
+        """
+        chain_len = len(self.chain)
+
+        # Solo ajustar en el intervalo exacto
+        if chain_len < DIFFICULTY_INTERVAL or chain_len % DIFFICULTY_INTERVAL != 0:
+            return self.difficulty
+
+        # Tiempo que tardaron los últimos DIFFICULTY_INTERVAL bloques
+        bloque_inicio = self.chain[-DIFFICULTY_INTERVAL]
+        bloque_fin    = self.chain[-1]
+        tiempo_real   = bloque_fin.timestamp - bloque_inicio.timestamp
+        tiempo_obj    = TARGET_BLOCK_TIME * DIFFICULTY_INTERVAL
+
+        # Limitar ajuste a factor 2 en cualquier dirección
+        if tiempo_real < tiempo_obj / 2:
+            tiempo_real = tiempo_obj / 2
+        if tiempo_real > tiempo_obj * 2:
+            tiempo_real = tiempo_obj * 2
+
+        nueva = round(self.difficulty * tiempo_obj / tiempo_real)
+        nueva = max(1, nueva)  # mínimo dificultad 1
+
+        if nueva != self.difficulty:
+            print(f"⚡ Dificultad ajustada: {self.difficulty} → {nueva} "                  f"(tiempo real={tiempo_real:.0f}s, objetivo={tiempo_obj}s)")
+
+        return nueva
+
     def validate_block(self, block) -> bool:
         latest = self.get_latest_block()
 
@@ -211,6 +296,10 @@ class Blockchain:
             return False
 
         if block.difficulty < genesis_difficulty:
+            return False
+
+        # Rechazar bloques con timestamp más de 2 horas en el futuro (igual que Bitcoin)
+        if block.timestamp > time.time() + 7200:
             return False
 
         transactions = block.transactions
@@ -244,8 +333,9 @@ class Blockchain:
             fees_total += fee
 
         coinbase_amount = coinbase.outputs[0].amount if coinbase.outputs else 0
+        expected_reward = get_mining_reward(len(self.chain))  # índice del bloque que se va a agregar
 
-        if coinbase_amount != MINING_REWARD + fees_total:
+        if coinbase_amount != expected_reward + fees_total:
             return False
 
         return True
@@ -262,9 +352,42 @@ class Blockchain:
             self.apply_transaction(tx, self.utxo_set)
 
         self.chain.append(block)
+
+        # Indexar TXs del nuevo bloque para búsqueda O(1)
+        for tx in block.transactions:
+            if hasattr(tx, "id"):
+                self.tx_index[tx.id] = block.index
+
+        # Ajustar dificultad si corresponde
+        nueva_dificultad = self.calculate_next_difficulty()
+        if nueva_dificultad != self.difficulty:
+            self.difficulty = nueva_dificultad
+
         storage.save_chain(self.chain)       # persistir cadena
         storage.save_utxo_set(self.utxo_set) # persistir UTXOs
         return True
+
+    def _rebuild_tx_index(self):
+        """Reconstruye el índice tx_id → block_index desde la cadena."""
+        self.tx_index = {}
+        for block in self.chain:
+            for tx in block.transactions:
+                if hasattr(tx, "id"):
+                    self.tx_index[tx.id] = block.index
+
+    def get_transaction(self, tx_id: str):
+        """
+        Busca una TX por ID en O(1) usando el índice.
+        Devuelve (tx, block_index) o (None, None) si no existe.
+        """
+        block_index = self.tx_index.get(tx_id)
+        if block_index is None:
+            return None, None
+        block = self.chain[block_index]
+        for tx in block.transactions:
+            if hasattr(tx, "id") and tx.id == tx_id:
+                return tx, block_index
+        return None, None
 
     # ======================
     # CHAIN VALIDATION
@@ -337,7 +460,12 @@ class Blockchain:
                     return False
 
                 if block.timestamp < prev.timestamp:
-                    print(f"Bloque {i}: timestamp inválido")
+                    print(f"Bloque {i}: timestamp inválido (retrocede)")
+                    return False
+
+                import time as _time
+                if block.timestamp > _time.time() + 7200:  # 2 horas
+                    print(f"Bloque {i}: timestamp demasiado en el futuro")
                     return False
 
             # ── Validaciones de transacciones ──
@@ -379,7 +507,7 @@ class Blockchain:
             # Validar monto de coinbase (excepto génesis)
             if coinbase_tx is not None:
                 if i > 0:
-                    expected = MINING_REWARD + fees_collected
+                    expected = get_mining_reward(i) + fees_collected
                     actual   = coinbase_tx.outputs[0].amount if coinbase_tx.outputs else 0
                     if actual != expected:
                         print(f"Bloque {i}: coinbase inválida — esperado={expected}, obtenido={actual}")

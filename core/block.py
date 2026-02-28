@@ -1,35 +1,64 @@
 import hashlib
+import json
+
+
+def _double_sha256(data: bytes) -> str:
+    """SHA256(SHA256(data)) — igual que Bitcoin. Devuelve hex string."""
+    return hashlib.sha256(hashlib.sha256(data).digest()).hexdigest()
+
+
+def _serialize_deterministic(data) -> bytes:
+    """JSON con sort_keys=True para serialización consistente entre nodos."""
+    return json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 class Block:
 
-    def __init__(self, index, timestamp, transactions, previous_hash, difficulty=2, nonce=0, hash=None):
-        self.index = index
-        self.timestamp = timestamp
-        self.transactions = transactions
+    def __init__(self, index, timestamp, transactions, previous_hash,
+                 difficulty=2, nonce=0, hash=None):
+        self.index         = index
+        self.timestamp     = timestamp
+        self.transactions  = transactions
         self.previous_hash = previous_hash
-        self.difficulty = difficulty
-        self.nonce = nonce
+        self.difficulty    = difficulty
+        self.nonce         = nonce
 
-        # Si nos pasan el hash (porque lo cargamos de disco), lo usamos directamente.
-        # Si no, significa que es un bloque nuevo y hay que minarlo.
         if hash is not None:
             self.hash = hash
         else:
             self.hash = self.mine_block()
 
-    def calculate_hash(self):
-        """Convierte las transacciones a dict para hashearlas de forma consistente."""
+    def _header_data(self) -> dict:
+        """
+        Datos que entran en el hash del bloque.
+        Serialización determinística: siempre produce los mismos bytes
+        para el mismo bloque, en cualquier nodo.
+        """
         tx_data = [
             tx.to_dict() if hasattr(tx, "to_dict") else tx
             for tx in self.transactions
         ]
-        block_string = f"{self.index}{self.timestamp}{tx_data}{self.previous_hash}{self.nonce}"
-        return hashlib.sha256(block_string.encode()).hexdigest()
+        return {
+            "index":         self.index,
+            "timestamp":     self.timestamp,
+            "transactions":  tx_data,
+            "previous_hash": self.previous_hash,
+            "difficulty":    self.difficulty,
+            "nonce":         self.nonce,
+        }
 
-    def mine_block(self):
-        """Busca un nonce tal que el hash empiece con N ceros (Proof of Work)."""
-        target = "0" * self.difficulty
+    def calculate_hash(self) -> str:
+        """
+        Hash del bloque usando doble SHA256 y serialización determinística.
+        El nonce NO entra en tx_data — solo en el header — así el minado
+        solo modifica el nonce sin recalcular las TXs.
+        """
+        data = _serialize_deterministic(self._header_data())
+        return _double_sha256(data)
+
+    def mine_block(self) -> str:
+        """Proof of Work: busca nonce tal que el hash empiece con N ceros."""
+        target       = "0" * self.difficulty
         hash_attempt = self.calculate_hash()
 
         while not hash_attempt.startswith(target):
@@ -38,12 +67,7 @@ class Block:
 
         return hash_attempt
 
-    # ------------------------------------------------------------------
-    # SERIALIZACIÓN
-    # ------------------------------------------------------------------
-
     def to_dict(self):
-        """Convierte el bloque a un diccionario JSON-serializable."""
         return {
             "index":         self.index,
             "timestamp":     self.timestamp,
@@ -59,10 +83,6 @@ class Block:
 
     @staticmethod
     def from_dict(data):
-        """
-        Reconstruye un bloque desde un diccionario.
-        Importamos Transaction acá adentro para evitar imports circulares.
-        """
         from core.transaction import Transaction
 
         transactions = [
@@ -70,13 +90,12 @@ class Block:
             for tx in data["transactions"]
         ]
 
-        # Le pasamos el hash guardado → el __init__ NO vuelve a minar
         return Block(
-            index=data["index"],
-            timestamp=data["timestamp"],
-            transactions=transactions,
-            previous_hash=data["previous_hash"],
-            difficulty=data["difficulty"],
-            nonce=data["nonce"],
-            hash=data["hash"],
+            index         = data["index"],
+            timestamp     = data["timestamp"],
+            transactions  = transactions,
+            previous_hash = data["previous_hash"],
+            difficulty    = data["difficulty"],
+            nonce         = data["nonce"],
+            hash          = data["hash"],
         )

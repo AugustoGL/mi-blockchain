@@ -6,6 +6,14 @@ Se corre en un thread separado para no bloquear el nodo P2P.
 """
 
 from flask import Flask, jsonify, request
+import time
+import collections
+import threading
+
+
+# Rate limiting — máximo de requests por IP por ventana de tiempo
+RATE_LIMIT_REQUESTS = 60   # máximo requests
+RATE_LIMIT_WINDOW   = 60   # por esta cantidad de segundos
 
 
 def create_app(blockchain, node, miner=None):
@@ -14,6 +22,30 @@ def create_app(blockchain, node, miner=None):
     Recibe blockchain y node como dependencias — sin variables globales.
     """
     app = Flask(__name__)
+
+    # ──────────────────────────────────────────────
+    # RATE LIMITING
+    # ──────────────────────────────────────────────
+
+    _request_counts = collections.defaultdict(list)  # {ip: [timestamps]}
+    _rl_lock        = threading.Lock()
+
+    @app.before_request
+    def rate_limit():
+        ip  = request.remote_addr
+        now = time.time()
+
+        with _rl_lock:
+            _request_counts[ip] = [
+                t for t in _request_counts[ip]
+                if now - t < RATE_LIMIT_WINDOW
+            ]
+            if len(_request_counts[ip]) >= RATE_LIMIT_REQUESTS:
+                return jsonify({
+                    "ok":    False,
+                    "error": f"Rate limit: máximo {RATE_LIMIT_REQUESTS} requests por {RATE_LIMIT_WINDOW}s"
+                }), 429
+            _request_counts[ip].append(now)
 
     # ──────────────────────────────────────────────
     # HELPERS
@@ -49,17 +81,14 @@ def create_app(blockchain, node, miner=None):
         body = request.get_json()
         if not body:
             return err("Body JSON requerido")
-
         host = body.get("host")
         port = body.get("port")
         if not host or not port:
             return err("Faltan campos: host, port")
-
         success = node.connect_to_peer(host, int(port))
         if success:
             return ok({"message": f"Conectado a {host}:{port}"})
-        else:
-            return err(f"No se pudo conectar a {host}:{port}")
+        return err(f"No se pudo conectar a {host}:{port}")
 
     # ──────────────────────────────────────────────
     # CADENA
@@ -75,11 +104,7 @@ def create_app(blockchain, node, miner=None):
 
     @app.route("/block/<int:index>")
     def block_by_index(index):
-        """
-        Bloque por índice.
-        GET /block/0  → génesis
-        GET /block/1  → primer bloque minado
-        """
+        """Bloque por índice. GET /block/0 → génesis."""
         if index < 0 or index >= len(blockchain.chain):
             return err(f"Bloque {index} no existe", 404)
         return ok(_serialize_block(blockchain.chain[index]))
@@ -115,7 +140,6 @@ def create_app(blockchain, node, miner=None):
         body = request.get_json()
         if not body:
             return err("Body JSON requerido")
-
         try:
             tx = Transaction.from_dict(body)
         except Exception as e:
@@ -124,14 +148,11 @@ def create_app(blockchain, node, miner=None):
         success = node.announce_transaction(tx)
         if success:
             return ok({"tx_id": tx.id, "message": "TX aceptada y propagada"}, 201)
-        else:
-            return err("TX inválida (UTXO inexistente, firma incorrecta, o doble gasto)")
+        return err("TX inválida (UTXO inexistente, firma incorrecta, o doble gasto)")
 
     @app.route("/transaction/<tx_id>")
     def get_transaction(tx_id):
-        """
-        Busca una TX en la cadena (confirmada) o en la mempool (pendiente).
-        """
+        """Busca una TX en la cadena (confirmada) o en la mempool (pendiente)."""
         for block in blockchain.chain:
             for tx in block.transactions:
                 if tx.id == tx_id:
@@ -173,7 +194,6 @@ def create_app(blockchain, node, miner=None):
         """
         Balance de una wallet.
         Body: { "address": "-----BEGIN PUBLIC KEY-----\\n..." }
-        Usamos POST porque la clave pública PEM es larga y tiene caracteres especiales.
         """
         body = request.get_json()
         if not body or "address" not in body:
@@ -209,7 +229,6 @@ def create_app(blockchain, node, miner=None):
         miner_address = body.get("miner_address")
         if not miner_address:
             return err("Falta campo: miner_address")
-
         if isinstance(miner_address, str):
             miner_address = miner_address.encode()
 
@@ -218,7 +237,7 @@ def create_app(blockchain, node, miner=None):
             return err("No se pudo minar")
 
         new_block = blockchain.get_latest_block()
-        node.announce_block(new_block)   # avisar a los peers
+        node.announce_block(new_block)
 
         return ok({
             "message":    f"Bloque #{new_block.index} minado exitosamente",
@@ -233,7 +252,7 @@ def create_app(blockchain, node, miner=None):
 
     @app.route("/mining/status")
     def mining_status():
-        """Estado del minado automático: si corre, cuántos bloques minó, etc."""
+        """Estado del minado automático."""
         if miner is None:
             return ok({"available": False, "message": "Minado automático no configurado"})
         return ok({"available": True, **miner.status()})
@@ -246,11 +265,6 @@ def create_app(blockchain, node, miner=None):
         miner.stop()
         return ok({"running": False, "message": "Minado pausado"})
 
-    @app.route("/network")
-    def network():
-        """Mapa de toda la red: todos los nodos conectados con su estado."""
-        return ok(node.get_network_map())
-
     @app.route("/mining/start", methods=["POST"])
     def mining_start():
         """Reanuda el minado automático si estaba pausado."""
@@ -258,6 +272,55 @@ def create_app(blockchain, node, miner=None):
             return err("Minado automático no disponible")
         miner.resume()
         return ok({"running": True, "message": "Minado reanudado"})
+
+    @app.route("/network")
+    def network():
+        """Mapa de toda la red: todos los nodos conectados con su estado."""
+        return ok(node.get_network_map())
+
+    # ──────────────────────────────────────────────
+    # FAUCET — solo para testing/desarrollo
+    # ──────────────────────────────────────────────
+
+    @app.route("/fund", methods=["POST"])
+    def fund():
+        """
+        Inyecta coins directamente en el UTXO set (faucet de testing).
+        NO modifica el génesis ni ningún bloque — solo el UTXO set en memoria.
+        Body: { "address": "-----BEGIN PUBLIC KEY-----...", "amount": 1000 }
+        """
+        body = request.get_json()
+        if not body:
+            return err("Body JSON requerido")
+
+        address = body.get("address")
+        amount  = int(body.get("amount", 100))
+
+        if not address:
+            return err("Falta campo: address")
+        if isinstance(address, str):
+            address = address.encode()
+
+        from core.transaction import Transaction, TxOutput
+        import hashlib
+        import time as _time
+
+        tx_out = TxOutput(amount=amount, recipient_public_key_pem=address)
+        tx     = Transaction(inputs=[], outputs=[tx_out])
+        # ID único basado en timestamp para evitar colisiones
+        tx.id  = hashlib.sha256(
+            f"fund-{_time.time()}-{address[:20]}".encode()
+        ).hexdigest()
+
+        # Solo inyectar en el UTXO set — NO tocar bloques ya minados
+        blockchain.utxo_set[(tx.id, 0)] = tx_out
+
+        from storage import storage
+        storage.save_utxo_set(blockchain.utxo_set)
+
+        return ok({"tx_id": tx.id, "amount": amount}, 201)
+
+    # ──────────────────────────────────────────────
     # SERIALIZADORES INTERNOS
     # ──────────────────────────────────────────────
 
@@ -296,68 +359,22 @@ def create_app(blockchain, node, miner=None):
             "outputs":     outputs,
         }
 
-    # ──────────────────────────────────────────────
-    # FAUCET — solo para testing/desarrollo
-    # ──────────────────────────────────────────────
-
-    @app.route("/fund", methods=["POST"])
-    def fund():
-        """
-        Inyecta coins directamente en el UTXO set de todos los nodos.
-        Solo para desarrollo/testing.
-        Body: { "address": "-----BEGIN PUBLIC KEY-----...", "amount": 1000 }
-        """
-        body = request.get_json()
-        if not body:
-            return err("Body JSON requerido")
-
-        address = body.get("address")
-        amount  = int(body.get("amount", 100))
-
-        if not address:
-            return err("Falta campo: address")
-
-        if isinstance(address, str):
-            address = address.encode()
-
-        from core.transaction import Transaction, TxOutput
-        import hashlib, time as _time
-
-        tx_out = TxOutput(amount=amount, recipient_public_key_pem=address)
-        tx     = Transaction(inputs=[], outputs=[tx_out])
-        tx.id  = hashlib.sha256(
-            f"fund-{_time.time()}-{address[:20]}".encode()
-        ).hexdigest()
-
-        # Inyectar en UTXO set y génesis
-        blockchain.utxo_set[(tx.id, 0)] = tx_out
-        blockchain.chain[0].transactions.append(tx)
-
-        import storage.storage as storage
-        storage.save_utxo_set(blockchain.utxo_set)
-
-        return ok({"tx_id": tx.id, "amount": amount}, 201)
-
     register_p2p_routes(app, blockchain, node)
     return app
 
 
 def register_p2p_routes(app, blockchain, node):
-    """
-    Registra los endpoints P2P en la app Flask.
-    Llamar desde create_app() después de crear la app.
-    """
+    """Registra los endpoints P2P en la app Flask."""
 
     @app.route("/p2p/handshake", methods=["POST"])
     def p2p_handshake():
         payload = request.get_json() or {}
         node.handle_handshake(payload)
-        # Responder con nuestra info
         return jsonify({
-            "ok":      True,
-            "url":     node.public_url,
-            "port":    node.port,
-            "version": "0.2",
+            "ok":           True,
+            "url":          node.public_url,
+            "port":         node.port,
+            "version":      "0.2",
             "chain_length": len(blockchain.chain),
         })
 

@@ -34,12 +34,6 @@ class Wallet:
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
 
-    def sign(self, message: bytes):
-        return self.private_key.sign(
-            message,
-            ec.ECDSA(hashes.SHA256())
-        )
-
     def get_balance(self, blockchain):
         balance = 0
         for key, utxo in blockchain.utxo_set.items():
@@ -48,15 +42,13 @@ class Wallet:
         return balance
 
     def select_utxos(self, blockchain, amount_needed):
-        locked = blockchain.get_locked_utxos()
+        locked   = blockchain.get_locked_utxos()
         selected = []
-        total = 0
+        total    = 0
 
         for (txid, idx), utxo in blockchain.utxo_set.items():
-            # ✅ FIX: comparar con self.address(), no self.public_key
             if utxo.recipient_public_key != self.address():
                 continue
-
             if (txid, idx) in locked:
                 continue
 
@@ -73,55 +65,30 @@ class Wallet:
         selected_utxos, total_available = self.select_utxos(blockchain, total_needed)
 
         if total_available < total_needed:
-            raise Exception(f"Fondos insuficientes: disponible={total_available}, necesario={total_needed}")
+            raise Exception(
+                f"Fondos insuficientes: disponible={total_available}, necesario={total_needed}"
+            )
 
-        # ✅ FIX: desempaquetar correctamente 3 valores
         inputs = []
         for txid, out_idx, _utxo in selected_utxos:
-            tx_input = TxInput(tx_id=txid, output_index=out_idx)
-            inputs.append(tx_input)
+            inputs.append(TxInput(tx_id=txid, output_index=out_idx))
 
-        outputs = [
-            TxOutput(amount=amount, recipient_public_key_pem=receiver_public_key_pem)
-        ]
+        outputs = [TxOutput(amount=amount, recipient_public_key_pem=receiver_public_key_pem)]
 
         change = total_available - total_needed
         if change > 0:
-            outputs.append(
-                TxOutput(amount=change, recipient_public_key_pem=self.address())
-            )
+            outputs.append(TxOutput(amount=change, recipient_public_key_pem=self.address()))
 
-        tx = Transaction(inputs=inputs, outputs=outputs)
-
-        # ✅ FIX: firmar con (tx_hash, private_key) en el orden correcto
+        tx      = Transaction(inputs=inputs, outputs=outputs)
         tx_hash = tx.hash_for_signature()
         for tx_input in tx.inputs:
             tx_input.sign(tx_hash, self.private_key)
 
         return tx
 
-    def fund_initial_balance(self, blockchain, amount=50):
-        """
-        Agrega un UTXO inicial simulando una TX en el bloque génesis.
-        La TX se registra en el bloque génesis Y en el utxo_set.
-        """
-        tx_output = TxOutput(amount=amount, recipient_public_key_pem=self.address())
-        tx = Transaction(inputs=[], outputs=[tx_output])
-
-        import hashlib, time
-        tx.id = hashlib.sha256(f"{time.time()}-{self.address()}".encode()).hexdigest()
-
-        # Agregar al utxo_set
-        blockchain.utxo_set[(tx.id, 0)] = tx_output
-
-        # ✅ También registrar en el bloque génesis para que validate_chain lo encuentre
-        blockchain.chain[0].transactions.append(tx)
-
-        return tx
-
     def get_utxos(self, blockchain):
         my_pubkey = self.address()
-        utxos = []
+        utxos     = []
         for (tx_id, out_idx), utxo in blockchain.utxo_set.items():
             if utxo.recipient_public_key == my_pubkey:
                 utxos.append((tx_id, out_idx, utxo))

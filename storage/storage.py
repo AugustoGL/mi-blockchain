@@ -161,3 +161,22 @@ def load_mempool():
 def has_saved_data():
     """Devuelve True si ya existe una blockchain guardada en disco."""
     return os.path.exists(_path("chain.json"))
+
+
+def save_peers(peers: set):
+    """Guarda la lista de peers conocidos en disco."""
+    _ensure_dir()
+    with open(_path("peers.json"), "w") as f:
+        json.dump(list(peers), f, indent=2)
+
+
+def load_peers() -> list:
+    """Carga los peers conocidos del disco. Devuelve lista vacía si no existe."""
+    path = _path("peers.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []

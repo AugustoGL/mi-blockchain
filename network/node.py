@@ -16,6 +16,15 @@ import urllib.error
 
 VERSION = "0.2"
 
+# Versión mínima aceptada — nodos con versión menor son rechazados
+MIN_VERSION = "0.2"
+
+# Penalización de peers — cuántos bloques inválidos antes de desconectar
+MAX_PEER_STRIKES = 3
+
+# Máximo desfasaje de tiempo permitido en un bloque (2 horas, igual que Bitcoin)
+MAX_TIMESTAMP_DRIFT = 2 * 60 * 60
+
 # La dificultad se lee del bloque génesis — no está hardcodeada acá
 # Todos los nodos que compartan el mismo génesis usan la misma dificultad
 
@@ -49,9 +58,10 @@ class Node:
         self.port       = port
         self.blockchain = blockchain
         self.public_url = f"http://127.0.0.1:{port}"
-        self.peers: set = set()   # URLs base de peers conocidos
-        self._lock      = threading.Lock()
-        self._running   = False
+        self.peers: set        = set()   # URLs base de peers conocidos
+        self._peer_strikes: dict = {}     # {peer_url: cantidad de bloques inválidos}
+        self._lock             = threading.Lock()
+        self._running          = False
 
     # ──────────────────────────────────────────
     # ARRANCAR / DETENER
@@ -60,6 +70,22 @@ class Node:
     def start(self):
         self._running = True
         print(f"[Node:{self.port}] 🟢 Nodo HTTP arrancado en puerto {self.port}")
+        self._load_peers_from_disk()
+
+    def _load_peers_from_disk(self):
+        """Al arrancar intenta reconectarse a los peers conocidos del disco."""
+        from storage import storage
+        peers_guardados = storage.load_peers()
+        if not peers_guardados:
+            return
+        print(f"[Node:{self.port}] 📋 {len(peers_guardados)} peers guardados en disco, reconectando...")
+        for peer_url in peers_guardados:
+            if peer_url != self.public_url:
+                threading.Thread(
+                    target=self.connect_to_peer,
+                    kwargs={"peer_host": None, "peer_port": None, "peer_url": peer_url},
+                    daemon=True
+                ).start()
 
     def stop(self):
         self._running = False
@@ -87,6 +113,11 @@ class Node:
         with self._lock:
             self.peers.add(peer_url)
 
+        # Persistir peers en disco para reconexión sin bootstrap
+        from storage import storage
+        with self._lock:
+            storage.save_peers(self.peers)
+
         print(f"[Node:{self.port}] ✅ Conectado a {peer_url}")
 
         # Sincronizar cadena
@@ -108,6 +139,12 @@ class Node:
         """
         peer_url = payload.get("url")
         if not peer_url or peer_url == self.public_url:
+            return False
+
+        # Validar versión de protocolo
+        peer_version = payload.get("version", "0.0")
+        if tuple(int(x) for x in peer_version.split(".")) < tuple(int(x) for x in MIN_VERSION.split(".")):
+            print(f"[Node:{self.port}] ❌ Peer {peer_url} rechazado: versión {peer_version} < {MIN_VERSION}")
             return False
 
         with self._lock:
@@ -167,6 +204,13 @@ class Node:
             print(f"[Node:{self.port}] ❌ Bloque rechazado: dificultad {block_difficulty} < {genesis_difficulty} (génesis)")
             return
 
+        # Validar timestamp — no aceptar bloques más de 2hs en el futuro
+        import time as _time
+        block_timestamp = payload.get("timestamp", 0)
+        if block_timestamp > _time.time() + MAX_TIMESTAMP_DRIFT:
+            print(f"[Node:{self.port}] ❌ Bloque rechazado: timestamp demasiado en el futuro")
+            return
+
         sender_url = payload.get("_sender_url")
 
         try:
@@ -178,9 +222,14 @@ class Node:
                 added = self.blockchain.add_block(block)
                 if added:
                     print(f"[Node:{self.port}] 📦 Bloque #{block.index} agregado")
+                    # Resetear strikes del peer si mandó un bloque válido
+                    if sender_url:
+                        with self._lock:
+                            self._peer_strikes[sender_url] = 0
                     self.broadcast_block(block, exclude=sender_url)
                 else:
                     print(f"[Node:{self.port}] ❌ Bloque #{block.index} inválido")
+                    self._penalizar_peer(sender_url)
 
             elif block.index > latest.index:
                 # FIX: el bloque es más nuevo — estamos atrasados
@@ -203,6 +252,28 @@ class Node:
 
         except Exception as e:
             print(f"[Node:{self.port}] ❌ Error procesando bloque: {e}")
+
+    def _penalizar_peer(self, peer_url):
+        """
+        Suma un strike al peer. Si supera MAX_PEER_STRIKES lo desconecta.
+        Los peers que mandan bloques inválidos repetidamente son maliciosos o buggeados.
+        """
+        if not peer_url:
+            return
+        with self._lock:
+            strikes = self._peer_strikes.get(peer_url, 0) + 1
+            self._peer_strikes[peer_url] = strikes
+
+        print(f"[Node:{self.port}] ⚠️  Strike {strikes}/{MAX_PEER_STRIKES} para {peer_url}")
+
+        if strikes >= MAX_PEER_STRIKES:
+            print(f"[Node:{self.port}] 🚫 {peer_url} baneado por bloques inválidos repetidos")
+            with self._lock:
+                self.peers.discard(peer_url)
+                self._peer_strikes.pop(peer_url, None)
+            from storage import storage
+            with self._lock:
+                storage.save_peers(self.peers)
 
     def handle_new_tx(self, payload):
         from core.transaction import Transaction
@@ -249,7 +320,7 @@ class Node:
     def _adopt_chain(self, chain_data, source_url):
         from core.block import Block
         from core.blockchain import Blockchain
-        import storage.storage as storage
+        from storage import storage
 
         try:
             # Leer dificultad del génesis de la cadena recibida
@@ -279,12 +350,49 @@ class Node:
                 print(f"[Node:{self.port}] ❌ Cadena de {source_url} inválida")
                 return
 
-            rebuilt_utxo             = temp_bc.rebuild_utxo_set(new_chain)
+            rebuilt_utxo = temp_bc.rebuild_utxo_set(new_chain)
+
+            # ── Reorg: devolver TXs de bloques descartados a la mempool ──
+            # Encontrar el punto de divergencia entre la cadena vieja y la nueva
+            vieja = self.blockchain.chain
+            fork_index = 0
+            for i in range(min(len(vieja), len(new_chain))):
+                if vieja[i].hash != new_chain[i].hash:
+                    fork_index = i
+                    break
+            else:
+                fork_index = min(len(vieja), len(new_chain))
+
+            # TXs que ya están confirmadas en la nueva cadena
+            txs_en_nueva = set()
+            for block in new_chain[fork_index:]:
+                for tx in block.transactions:
+                    if isinstance(tx, dict):
+                        from core.transaction import Transaction
+                        tx = Transaction.from_dict(tx)
+                    if not tx.is_coinbase():
+                        txs_en_nueva.add(tx.id)
+
+            # TXs de bloques descartados que no están en la nueva cadena
+            txs_recuperadas = 0
+            for block in vieja[fork_index:]:
+                for tx in block.transactions:
+                    if isinstance(tx, dict):
+                        from core.transaction import Transaction
+                        tx = Transaction.from_dict(tx)
+                    if not tx.is_coinbase() and tx.id not in txs_en_nueva:
+                        self.blockchain.pending_transactions.append(tx)
+                        txs_recuperadas += 1
+
+            if txs_recuperadas > 0:
+                print(f"[Node:{self.port}] ♻️  {txs_recuperadas} TXs devueltas a la mempool tras reorg")
+                storage.save_mempool(self.blockchain.pending_transactions)
+
             self.blockchain.chain    = new_chain
             self.blockchain.utxo_set = rebuilt_utxo
 
             print(f"[Node:{self.port}] ✅ Cadena adoptada: "
-                  f"{len(new_chain)} bloques desde {source_url}")
+                  f"{len(new_chain)} bloques desde {source_url} (fork en bloque #{fork_index})")
 
             storage.save_all(self.blockchain)
 
